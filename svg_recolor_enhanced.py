@@ -143,36 +143,7 @@ def _resolve_svg_path(path: str) -> str:
     return current
 
 
-def _is_shortcut(path: str) -> str | None:
-    """
-    Check if the file is a text redirect (shortcut).
-    Returns the target path as written in the file, or None if it's a real SVG.
-    """
-    try:
-        with open(path, 'rb') as fh:
-            head = fh.read(256)
-    except OSError:
-        return None
-    if head.startswith(b'\xef\xbb\xbf'):
-        head = head[3:]
-    head = head.strip()
-    # Binary / real SVG detection
-    if head[:2] == b'\x1f\x8b' or head[:4] in (b'<svg', b'<?xm', b'<!--'):
-        return None
-    if b'<svg' in head[:64].lower():
-        return None
-    try:
-        text = head.decode('utf-8').strip()
-    except Exception:
-        return None
-    # Single line, no spaces, ends with .svg
-    if '\n' not in text and ' ' not in text and len(text) < 256 and text.lower().endswith('.svg'):
-        return text
-    return None
-
-
 def read_svg(path):
-    path = _resolve_svg_path(path)
     with open(path,'rb') as fh: raw = fh.read()
     # Strip UTF-8 BOM
     if raw.startswith(b'\xef\xbb\xbf'):
@@ -273,18 +244,69 @@ def recolor_text(text, r2n, n2new):
 #  Module-level worker  (called from thread pool)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _read_redirect_target(path: str):
+    """
+    If `path` is a text-redirect file (contains only a bare filename like 'folder-new.svg'),
+    return the target filename string. Otherwise return None.
+    """
+    try:
+        with open(path, 'rb') as fh:
+            head = fh.read(512)
+    except OSError:
+        return None
+    if head.startswith(b'\xef\xbb\xbf'):
+        head = head[3:]
+    head_stripped = head.strip()
+    # Real SVG / SVGZ starts with these
+    if (head_stripped[:2] == b'\x1f\x8b'
+            or head_stripped[:4] in (b'<svg', b'<?xm', b'<!--')
+            or b'<svg' in head_stripped[:128].lower()):
+        return None
+    try:
+        text = head_stripped.decode('utf-8').strip()
+    except Exception:
+        return None
+    # Single token, no whitespace, ends with .svg, short enough
+    if ('\n' not in text and '\r' not in text and ' ' not in text
+            and len(text) < 256 and text.lower().endswith('.svg')):
+        return text
+    return None
+
+
 def _recolor_file(src_path, dst_path, colors, mono_color):
     """Returns (fname, success, info_str)."""
     fname = os.path.basename(src_path)
     try:
-        # --- Check if the file itself is a shortcut (text redirect) ---
-        target_rel = _is_shortcut(src_path)
-        if target_rel is not None:
-            os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-            shutil.copy2(src_path, dst_path)
-            return fname, True, f'Shortcut → {target_rel} copied'
+        # ── Detect text-redirect (shortcut) files ─────────────────────────
+        redirect_target = _read_redirect_target(src_path)
+        if redirect_target is not None:
+            # Resolve the target relative to src_path's directory
+            src_dir   = os.path.dirname(src_path)
+            target_abs = os.path.normpath(os.path.join(src_dir, redirect_target))
+            if not os.path.isfile(target_abs):
+                # Try just the basename in the same dir
+                target_abs = os.path.join(src_dir, os.path.basename(redirect_target))
+            if not os.path.isfile(target_abs):
+                return fname, False, 'Redirect target not found: {}'.format(redirect_target)
 
-        # --- Normal SVG processing ---
+            # In the OUTPUT folder, create an OS symlink pointing at the
+            # corresponding output file for the target.
+            # Both files will be recolored; the symlink makes KDE happy.
+            dst_dir         = os.path.dirname(dst_path)
+            target_basename = os.path.basename(target_abs)
+            # The target's output path will sit in the same output subdirectory
+            # (same relative structure as source)
+            src_root = os.path.commonpath([src_path, target_abs])
+            rel_to_src_dir  = os.path.relpath(target_abs, src_dir)
+            symlink_target  = rel_to_src_dir          # relative symlink
+
+            os.makedirs(dst_dir, exist_ok=True)
+            if os.path.lexists(dst_path):
+                os.remove(dst_path)
+            os.symlink(symlink_target, dst_path)
+            return fname, True, 'symlink → {}'.format(redirect_target)
+
+        # ── Normal SVG ─────────────────────────────────────────────────────
         text = read_svg(src_path)
         if not text.strip(): return fname, False, 'Empty file'
         text = preprocess(text)
