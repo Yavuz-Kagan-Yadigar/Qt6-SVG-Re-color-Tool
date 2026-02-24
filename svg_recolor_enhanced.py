@@ -360,13 +360,35 @@ class ProcessThread(QThread):
         self._mutex.lock(); v = self._running; self._mutex.unlock(); return v
 
     def run(self):
-        # ── collect all jobs ───────────────────────────────────────────────
-        all_jobs = []
-        for root, dirs, files in os.walk(self.src_dir):
+        # ── Phase 1: copy non-SVG files + preserve all OS symlinks ────────
+        # OS symlinks (even .svg ones like @2x dirs) are recreated as symlinks.
+        # Only regular (non-symlink) SVG files go into the recolor queue.
+        for root, dirs, files in os.walk(self.src_dir, followlinks=False):
             dirs[:] = sorted(d for d in dirs if not d.startswith('.'))
             for f in sorted(files):
-                if f.lower().endswith('.svg'):
-                    src = os.path.join(root, f)
+                src = os.path.join(root, f)
+                dst = os.path.join(self.out_dir, os.path.relpath(src, self.src_dir))
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+
+                if os.path.islink(src):
+                    # Always recreate OS symlinks verbatim
+                    link_target = os.readlink(src)
+                    if os.path.lexists(dst): os.remove(dst)
+                    os.symlink(link_target, dst)
+                elif not f.lower().endswith('.svg'):
+                    # Non-SVG regular file → copy
+                    try:
+                        shutil.copy2(src, dst)
+                    except Exception:
+                        pass
+
+        # ── Phase 2: collect recolor jobs (regular SVG files only) ────────
+        all_jobs = []
+        for root, dirs, files in os.walk(self.src_dir, followlinks=False):
+            dirs[:] = sorted(d for d in dirs if not d.startswith('.'))
+            for f in sorted(files):
+                src = os.path.join(root, f)
+                if f.lower().endswith('.svg') and not os.path.islink(src):
                     dst = os.path.join(self.out_dir, os.path.relpath(src, self.src_dir))
                     all_jobs.append((src, dst))
 
@@ -375,16 +397,15 @@ class ProcessThread(QThread):
         if total == 0:
             self.finished.emit(0, 0); return
 
-        # ── thread pool with sliding window ───────────────────────────────
+        # ── Phase 3: thread pool with sliding window ───────────────────────
         n_workers = min((os.cpu_count() or 4) * 2, 16)
-        WINDOW    = max(n_workers * 8, 128)   # max in-flight futures
+        WINDOW    = max(n_workers * 8, 128)
 
         done_count = ok_count = 0
         job_idx    = 0
-        in_flight  = {}           # future → src_path
+        in_flight  = {}
 
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
-            # initial fill
             while job_idx < total and len(in_flight) < WINDOW:
                 src, dst = all_jobs[job_idx]
                 f = ex.submit(_recolor_file, src, dst, self.colors, self.mono_color)
@@ -408,7 +429,6 @@ class ProcessThread(QThread):
                     self.file_done.emit(fname, ok, info)
                     self.progress.emit(done_count, total)
 
-                    # replenish window
                     if job_idx < total and self.is_running():
                         src2, dst2 = all_jobs[job_idx]
                         f2 = ex.submit(_recolor_file, src2, dst2,
