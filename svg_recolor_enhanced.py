@@ -17,16 +17,16 @@ import sys
 import shutil
 import datetime
 import subprocess
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QFileDialog, QTextEdit,
     QGroupBox, QProgressBar, QColorDialog, QGridLayout,
-    QSpinBox, QMessageBox, QCheckBox,
+    QSpinBox, QMessageBox, QCheckBox, QSizePolicy,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QMutex, QTimer
-from PyQt6.QtGui import QPalette, QColor
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QMutex, QTimer, QPoint
+from PyQt6.QtGui import QPalette, QColor, QPainter, QLinearGradient, QPen, QBrush, QPolygon, QFontMetrics
 from PyQt6.QtSvgWidgets import QSvgWidget
 
 
@@ -79,16 +79,39 @@ def interpolate(c1, c2, t):
         round(r1+(r2-r1)*t), round(g1+(g2-g1)*t), round(b1+(b2-b1)*t))
 
 
-def build_gradient(base, n):
+def build_gradient(base, n, positions=None):
+    """
+    base      : list of hex colours, in stop order
+    n         : how many output colours to produce (uniformly sampled in t)
+    positions : optional list, same length as `base`, giving each base
+                colour's position in [0,1]. If omitted, stops are assumed
+                evenly spaced (old behaviour, kept for compatibility).
+    """
     k = len(base)
     if n <= 0: return []
     if n == 1: return [base[0]]
-    if n <= k: return base[:n]
+
+    if positions is None:
+        if n <= k: return base[:n]
+        positions = [i/(k-1) for i in range(k)] if k > 1 else [0.0]
+
+    pairs = sorted(zip(positions, base))
+    pos   = [p for p, _ in pairs]
+    cols  = [c for _, c in pairs]
+
     res = []
     for i in range(n):
         t = i/(n-1)
-        seg = min(int(t*(k-1)), k-2)
-        res.append(interpolate(base[seg], base[seg+1], (t-seg/(k-1))*(k-1)))
+        if t <= pos[0]:
+            res.append(cols[0]); continue
+        if t >= pos[-1]:
+            res.append(cols[-1]); continue
+        seg = 0
+        while seg < len(pos)-2 and t > pos[seg+1]:
+            seg += 1
+        span = pos[seg+1] - pos[seg]
+        local_t = (t - pos[seg]) / span if span > 0 else 0.0
+        res.append(interpolate(cols[seg], cols[seg+1], local_t))
     return res
 
 
@@ -273,7 +296,7 @@ def _read_redirect_target(path: str):
     return None
 
 
-def _recolor_file(src_path, dst_path, colors, mono_color):
+def _recolor_file(src_path, dst_path, colors, mono_color, positions=None):
     """Returns (fname, success, info_str)."""
     fname = os.path.basename(src_path)
     try:
@@ -321,7 +344,7 @@ def _recolor_file(src_path, dst_path, colors, mono_color):
             n2new = {n: mono_color for n in nset}
             tag = 'mono → {}'.format(mono_color)
         else:
-            u = sorted(nset); g = build_gradient(colors, len(u))
+            u = sorted(nset); g = build_gradient(colors, len(u), positions=positions)
             n2new = dict(zip(u, g)); tag = '{} colours'.format(len(u))
 
         new_text = recolor_text(text, r2n, n2new)
@@ -344,12 +367,13 @@ class ProcessThread(QThread):
     finished     = pyqtSignal(int, int)
     stopped      = pyqtSignal()
 
-    def __init__(self, src_dir, out_dir, colors, mono_color):
+    def __init__(self, src_dir, out_dir, colors, mono_color, positions=None):
         super().__init__()
         self.src_dir    = src_dir
         self.out_dir    = out_dir
         self.colors     = colors
         self.mono_color = mono_color
+        self.positions  = positions   # stop positions [0..1], same order as colors
         self._running   = True
         self._mutex     = QMutex()
 
@@ -397,18 +421,22 @@ class ProcessThread(QThread):
         if total == 0:
             self.finished.emit(0, 0); return
 
-        # ── Phase 3: thread pool with sliding window ───────────────────────
-        n_workers = min((os.cpu_count() or 4) * 2, 16)
+        # ── Phase 3: process pool with sliding window ──────────────────────
+        # CPU-bound regex work: real parallelism needs separate processes
+        # (threads are GIL-serialized for this workload). Oversubscribing
+        # process count past core count just adds spawn/pickle overhead.
+        n_workers = max(1, min(os.cpu_count() or 4, 16))
         WINDOW    = max(n_workers * 8, 128)
 
         done_count = ok_count = 0
         job_idx    = 0
         in_flight  = {}
 
-        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        with ProcessPoolExecutor(max_workers=n_workers) as ex:
             while job_idx < total and len(in_flight) < WINDOW:
                 src, dst = all_jobs[job_idx]
-                f = ex.submit(_recolor_file, src, dst, self.colors, self.mono_color)
+                f = ex.submit(_recolor_file, src, dst, self.colors, self.mono_color,
+                              self.positions)
                 in_flight[f] = src; job_idx += 1
 
             while in_flight:
@@ -432,7 +460,7 @@ class ProcessThread(QThread):
                     if job_idx < total and self.is_running():
                         src2, dst2 = all_jobs[job_idx]
                         f2 = ex.submit(_recolor_file, src2, dst2,
-                                       self.colors, self.mono_color)
+                                       self.colors, self.mono_color, self.positions)
                         in_flight[f2] = src2; job_idx += 1
 
         if self.is_running():
@@ -453,12 +481,15 @@ class ColorButton(QPushButton):
         self.set_color(QColor(hex_color))
         self.clicked.connect(self._pick)
 
-    def set_color(self, color):
+    def set_color(self, color: QColor):
         self._color = color
+        p = self.palette()
+        mid   = p.color(QPalette.ColorRole.Mid).name()
+        light = p.color(QPalette.ColorRole.Light).name()
         self.setStyleSheet(
-            'QPushButton{{background:{c};border:2px solid #555;border-radius:23px;}}'
-            'QPushButton:hover{{border:2px solid #888;border-radius:23px;}}'
-            .format(c=color.name()))
+            'QPushButton{{background:{c};border:2px solid {m};border-radius:23px;}}'
+            'QPushButton:hover{{border:2px solid {l};border-radius:23px;}}'
+            .format(c=color.name(), m=mid, l=light))
         self.setToolTip('{}: {}'.format(self._label, color.name()))
 
     def _pick(self):
@@ -470,17 +501,256 @@ class ColorButton(QPushButton):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Blender-style gradient color ramp widget
+# ══════════════════════════════════════════════════════════════════════════════
+
+class GradientRamp(QWidget):
+    """
+    Blender-style gradient ramp.
+
+    Layout (top → bottom):
+      [gradient bar]          ← RAMP_H px tall
+      [upward triangles]      ← HDL_H px, tip touches the bar bottom edge
+      [hex labels]            ← LBL_H px
+
+    Behaviour:
+    • Drag a handle to slide its stop position (first/last stops are locked).
+    • Single-click (no drag) opens the colour picker for that stop.
+    """
+
+    # ── geometry constants ────────────────────────────────────────────────
+    _RAMP_H = 30
+    _HDL_H  = 16   # triangle height (tip at ramp bottom, base below)
+    _HDL_W  = 10   # half-width of triangle base
+    _LBL_H  = 18
+    _PAD    = 20   # left/right padding so edge handles fit
+
+    def __init__(self, color_buttons: list, parent=None):
+        super().__init__(parent)
+        self._btns    = color_buttons
+        self._active  = 2
+        # Normalised positions [0.0 … 1.0] for each stop
+        self._pos     = [0.0, 1.0, 0.5, 0.5, 0.5, 0.5]
+
+        h = self._RAMP_H + self._HDL_H + self._LBL_H + 10
+        self.setMinimumHeight(h)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMouseTracking(True)
+
+        self._hovered  = -1   # index of hovered stop
+        self._dragging = -1   # index of stop being dragged
+        self._drag_x0  = 0    # mouse x at drag start
+        self._drag_t0  = 0.0  # stop t at drag start
+        self._moved    = False  # did we actually move during this press?
+
+        for b in self._btns:
+            b.clicked.connect(self.update)
+
+    # ── public API ────────────────────────────────────────────────────────
+
+    def set_active(self, n: int):
+        # Only re-distribute stops evenly when the *count* actually changes.
+        # Calling this repeatedly with the same n (e.g. redundant UI syncs)
+        # must NOT wipe out positions the user already dragged.
+        if n == self._active:
+            return
+        self._active = n
+        if n > 1:
+            for i in range(n):
+                self._pos[i] = i / (n - 1)
+        elif n == 1:
+            self._pos[0] = 0.0
+        self.update()
+
+    # ── coordinate helpers ────────────────────────────────────────────────
+
+    def _ramp_x(self)  -> int:  return self._PAD
+    def _ramp_w(self)  -> int:  return max(1, self.width() - 2 * self._PAD)
+    def _ramp_y(self)  -> int:  return 4
+    def _tip_y(self)   -> int:  return self._ramp_y() + self._RAMP_H  # tip of ▲ touches here
+    def _base_y(self)  -> int:  return self._tip_y() + self._HDL_H
+    def _lbl_y(self)   -> int:  return self._base_y() + 2
+
+    def _t_to_x(self, t: float) -> int:
+        return self._ramp_x() + round(t * self._ramp_w())
+
+    def _x_to_t(self, x: int) -> float:
+        t = (x - self._ramp_x()) / self._ramp_w()
+        return max(0.0, min(1.0, t))
+
+    def _sorted_stops(self):
+        """Return list of (t, index) sorted by position."""
+        n = self._active
+        return sorted((self._pos[i], i) for i in range(n))
+
+    def _hit(self, px: float) -> int:
+        """Return index of stop whose handle contains pixel px, else -1."""
+        for i in range(self._active):
+            if abs(self._t_to_x(self._pos[i]) - px) <= self._HDL_W + 2:
+                return i
+        return -1
+
+    # ── paint ─────────────────────────────────────────────────────────────
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        rx = self._ramp_x();  rw = self._ramp_w()
+        ry = self._ramp_y();  rh = self._RAMP_H
+        tip_y  = self._tip_y()
+        base_y = self._base_y()
+        lbl_y  = self._lbl_y()
+        n = self._active
+
+        # ── gradient bar ─────────────────────────────────────────────────
+        grad = QLinearGradient(rx, 0, rx + rw, 0)
+        stops = self._sorted_stops()
+        for t, i in stops:
+            grad.setColorAt(t, QColor(self._btns[i].hex()))
+
+        pal      = self.palette()
+        base_bg  = pal.color(QPalette.ColorRole.Base)
+        border_c = pal.color(QPalette.ColorRole.Mid)
+
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(base_bg))
+        p.drawRoundedRect(rx, ry, rw, rh, 4, 4)
+        p.setBrush(QBrush(grad))
+        p.drawRoundedRect(rx, ry, rw, rh, 4, 4)
+        p.setPen(QPen(border_c, 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(rx, ry, rw, rh, 4, 4)
+
+        # ── handles (upward triangles: tip at ramp bottom, base below) ───
+        font = self.font(); font.setPointSize(8); p.setFont(font)
+        fm   = QFontMetrics(font)
+        hw   = self._HDL_W
+
+        for i in range(n):
+            x   = self._t_to_x(self._pos[i])
+            col = QColor(self._btns[i].hex())
+
+            # ▲ tip touches the bar; base is below
+            tip  = QPoint(x,      tip_y)
+            lft  = QPoint(x - hw, base_y)
+            rgt  = QPoint(x + hw, base_y)
+            poly = QPolygon([tip, lft, rgt])
+
+            is_sel  = (i == self._dragging)
+            is_hov  = (i == self._hovered)
+            win_txt = pal.color(QPalette.ColorRole.WindowText)
+            outline = (win_txt if is_sel else
+                       _mix(win_txt, base_bg, 0.2) if is_hov else
+                       _mix(win_txt, base_bg, 0.45))
+
+            p.setPen(QPen(outline, 1.5))
+            p.setBrush(QBrush(col))
+            p.drawPolygon(poly)
+
+            # thin vertical stem from tip up to bottom of bar
+            p.setPen(QPen(outline, 1))
+            p.drawLine(x, ry + rh - 1, x, tip_y)
+
+            # hex label
+            label = col.name().upper()
+            lw    = fm.horizontalAdvance(label)
+            lx    = max(0, min(x - lw // 2, self.width() - lw))
+            lbl_col = (_mix(win_txt, base_bg, 0.15) if (is_hov or is_sel)
+                       else _mix(win_txt, base_bg, 0.4))
+            p.setPen(lbl_col)
+            p.drawText(lx, lbl_y + fm.ascent(), label)
+
+        p.end()
+
+    # ── mouse events ──────────────────────────────────────────────────────
+
+    def _mouse_x(self, event) -> float:
+        return event.position().x() if hasattr(event, 'position') else float(event.x())
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        px = self._mouse_x(event)
+        hit = self._hit(px)
+        if hit >= 0:
+            self._dragging = hit
+            self._drag_x0  = px
+            self._drag_t0  = self._pos[hit]
+            self._moved    = False
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        px = self._mouse_x(event)
+
+        if self._dragging >= 0:
+            dx = px - self._drag_x0
+            # Only start moving if cursor has travelled > 3px
+            if abs(dx) > 3 or self._moved:
+                self._moved = True
+                i = self._dragging
+                # First and last stops are locked to 0 and 1
+                if i == 0:
+                    pass
+                elif i == self._active - 1:
+                    pass
+                else:
+                    new_t = self._drag_t0 + dx / self._ramp_w()
+                    self._pos[i] = max(0.01, min(0.99, new_t))
+                    self.update()
+            return
+
+        # Hover detection
+        prev = self._hovered
+        self._hovered = self._hit(px)
+        if self._hovered != prev:
+            self.update()
+        self.setCursor(
+            Qt.CursorShape.SizeHorCursor if self._hovered >= 0
+            else Qt.CursorShape.ArrowCursor)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        i = self._dragging
+        if i >= 0 and not self._moved:
+            # Click without drag → open colour picker
+            self._btns[i]._pick()
+            self.update()
+        self._dragging = -1
+        self._moved    = False
+        self.update()
+
+    def mouseDoubleClickEvent(self, event):
+        # Double-click also opens colour picker (convenience)
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        px  = self._mouse_x(event)
+        hit = self._hit(px)
+        if hit >= 0:
+            self._btns[hit]._pick()
+            self.update()
+
+    def leaveEvent(self, event):
+        self._hovered = -1
+        self.update()
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Filtered log widget
 # ══════════════════════════════════════════════════════════════════════════════
 
 # HTML colour for each category
-_CAT_COLOR = {
-    'ok':   '#55cc66',
-    'err':  '#ff5555',
-    'info': '#888888',
-    'sep':  '#555566',
-}
-_MAX_DISPLAY = 30_000   # render at most this many lines in the widget
+def _cat_colors(palette: QPalette) -> dict:
+    """Derive log category colours from the active palette."""
+    is_dark = palette.color(QPalette.ColorRole.Window).value() < 128
+    if is_dark:
+        return {'ok': '#55cc66', 'err': '#ff5555', 'info': '#888888', 'sep': '#555566'}
+    else:
+        return {'ok': '#1a7a30', 'err': '#cc2222', 'info': '#555555', 'sep': '#8888aa'}
+
+_MAX_DISPLAY = 30_000
 
 
 class FilteredLog(QWidget):
@@ -502,10 +772,8 @@ class FilteredLog(QWidget):
 
         self._view = QTextEdit()
         self._view.setReadOnly(True)
-        self._view.setStyleSheet(
-            'QTextEdit{background:#0d0d0d;border:1px solid #282828;border-radius:5px;'
-            'font-family:Consolas,"Courier New",monospace;font-size:11px;padding:6px;}')
         layout.addWidget(self._view)
+        self._apply_log_style()
 
         # debounce filter changes
         self._rebuild_timer = QTimer()
@@ -516,6 +784,23 @@ class FilteredLog(QWidget):
         self._errors_only.stateChanged.connect(self._rebuild_timer.start)
 
     # ── public API ─────────────────────────────────────────────────────────
+
+    def _apply_log_style(self):
+        p   = self.palette()
+        bg  = _mix(p.color(QPalette.ColorRole.Base),
+                   p.color(QPalette.ColorRole.Window), 0.7)
+        bdr = p.color(QPalette.ColorRole.Mid)
+        self._view.setStyleSheet(
+            'QTextEdit{{background:{bg};border:1px solid {bdr};border-radius:5px;'
+            'font-family:Consolas,"Courier New",monospace;font-size:11px;padding:6px;}}'
+            .format(bg=bg.name(), bdr=bdr.name()))
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        from PyQt6.QtCore import QEvent
+        if event.type() == QEvent.Type.PaletteChange:
+            self._apply_log_style()
+            self._rebuild()
 
     def set_search(self, text: str):
         """Called externally when the shared search bar changes."""
@@ -546,7 +831,8 @@ class FilteredLog(QWidget):
     def _to_html(self, category, text):
         safe = (text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
                     .replace('\n', '<br>'))
-        color = _CAT_COLOR.get(category, '#aaaaaa')
+        colors = _cat_colors(self.palette())
+        color  = colors.get(category, colors['info'])
         return '<span style="color:{}">{}</span>'.format(color, safe)
 
     def _append_html(self, html):
@@ -564,9 +850,10 @@ class FilteredLog(QWidget):
         self._view.clear()
         html_parts = []
         if truncated:
+            muted = _cat_colors(self.palette())['info']
             html_parts.append(
-                '<span style="color:#666">… earlier entries hidden '
-                '(showing last {:,})</span>'.format(_MAX_DISPLAY))
+                '<span style="color:{}">… earlier entries hidden '
+                '(showing last {:,})</span>'.format(muted, _MAX_DISPLAY))
 
         for cat, txt in visible:
             html_parts.append(self._to_html(cat, txt))
@@ -580,156 +867,264 @@ class FilteredLog(QWidget):
 #  Main window
 # ══════════════════════════════════════════════════════════════════════════════
 
-_APP_QSS = """
-QWidget {
-    background-color: #141414;
-    color: #d0d0d0;
+# ══════════════════════════════════════════════════════════════════════════════
+#  Palette-driven theming  (follows the system/Qt theme automatically)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _mix(a: QColor, b: QColor, t: float) -> QColor:
+    """Linear interpolate between two QColors (t=0 → a, t=1 → b)."""
+    return QColor(
+        int(a.red()   + (b.red()   - a.red())   * t),
+        int(a.green() + (b.green() - a.green()) * t),
+        int(a.blue()  + (b.blue()  - a.blue())  * t),
+    )
+
+def _lighter(c: QColor, factor: float) -> QColor:
+    return QColor.fromHsvF(
+        c.hsvHueF(),
+        max(0.0, c.hsvSaturationF() * (1 - factor * 0.3)),
+        min(1.0, c.valueF() + factor * 0.25),
+    )
+
+def _col(c: QColor) -> str:
+    return c.name()
+
+def build_qss(palette: QPalette) -> str:
+    """
+    Generate a QSS sheet derived entirely from the system QPalette.
+    Structural rules only — all colours come from palette roles.
+    """
+    base    = palette.color(QPalette.ColorRole.Base)
+    alt     = palette.color(QPalette.ColorRole.AlternateBase)
+    window  = palette.color(QPalette.ColorRole.Window)
+    btn_bg  = palette.color(QPalette.ColorRole.Button)
+    btn_txt = palette.color(QPalette.ColorRole.ButtonText)
+    txt     = palette.color(QPalette.ColorRole.Text)
+    win_txt = palette.color(QPalette.ColorRole.WindowText)
+    hi      = palette.color(QPalette.ColorRole.Highlight)
+    hi_txt  = palette.color(QPalette.ColorRole.HighlightedText)
+    mid     = palette.color(QPalette.ColorRole.Mid)
+    dark    = palette.color(QPalette.ColorRole.Dark)
+    shadow  = palette.color(QPalette.ColorRole.Shadow)
+    light   = palette.color(QPalette.ColorRole.Light)
+    dis_txt = palette.color(QPalette.ColorGroup.Disabled,
+                             QPalette.ColorRole.ButtonText)
+
+    # Derived tones
+    btn_hover   = _mix(btn_bg, light, 0.25)
+    btn_pressed = _mix(btn_bg, dark,  0.35)
+    border      = _mix(btn_bg, dark,  0.6)
+    border_foc  = hi
+    input_bg    = _mix(base, window, 0.4)
+    scroll_bg   = _mix(window, dark, 0.3)
+    scroll_hdl  = _mix(mid, dark, 0.3)
+
+    # Action-button accent colours: derive from highlight, staying readable
+    is_dark = window.value() < 128
+
+    def accent(h: int, s: float, v_dark: float, v_light: float) -> tuple:
+        """Return (border, text, disabled_border, disabled_text) for an action btn."""
+        v  = v_dark if is_dark else v_light
+        vd = max(0.0, v - 0.25)
+        c_border = QColor.fromHsvF(h/360, s, v)
+        c_text   = QColor.fromHsvF(h/360, s * 0.5, min(1.0, v + 0.35))
+        c_dbdr   = QColor.fromHsvF(h/360, s * 0.4, vd)
+        c_dtxt   = QColor.fromHsvF(h/360, s * 0.3, vd + 0.1)
+        return _col(c_border), _col(c_text), _col(c_dbdr), _col(c_dtxt)
+
+    g_bdr, g_txt, g_dbdr, g_dtxt = accent(140, 0.65, 0.40, 0.35)  # green  start
+    y_bdr, y_txt, y_dbdr, y_dtxt = accent( 38, 0.70, 0.45, 0.40)  # yellow stop
+    b_bdr, b_txt, b_dbdr, b_dtxt = accent(210, 0.65, 0.45, 0.38)  # blue   open
+    r_bdr, r_txt, r_dbdr, r_dtxt = accent(  0, 0.65, 0.40, 0.35)  # red    delete
+    p_bdr, p_txt, p_dbdr, p_dtxt = accent(275, 0.55, 0.42, 0.38)  # purple install-root
+    c_bdr, c_txt, c_dbdr, c_dtxt = accent(210, 0.55, 0.42, 0.38)  # cyan   install-user
+
+    hover_bg = _col(btn_hover)
+    arr_col  = _col(_mix(win_txt, btn_bg, 0.3))
+    arr_dis  = _col(dis_txt)
+
+    # Muted / accent tones for informational labels & preview panel
+    muted_txt   = _col(_mix(win_txt, window, 0.5))
+    accent_txt  = _col(_mix(hi, win_txt, 0.35))
+    preview_bg  = _col(_mix(base, shadow, 0.15 if is_dark else 0.05))
+    preview_bdr = _col(_mix(border, shadow, 0.2))
+
+    return f"""
+QWidget {{
+    background-color: {_col(window)};
+    color: {_col(win_txt)};
     font-size: 13px;
     font-weight: 600;
-}
-QLabel {
-    color: #d8d8d8;
+}}
+QLabel {{
+    color: {_col(win_txt)};
     font-size: 13px;
     font-weight: 600;
-}
-QGroupBox {
-    border: 1px solid #2e2e2e;
+}}
+QGroupBox {{
+    border: 1px solid {_col(border)};
     border-radius: 6px;
     margin-top: 12px;
     padding-top: 4px;
     font-size: 12px;
     font-weight: 700;
-}
-QGroupBox::title {
+}}
+QGroupBox::title {{
     subcontrol-origin: margin;
     left: 10px;
     padding: 0 5px;
-    color: #bbbbbb;
+    color: {_col(_mix(win_txt, btn_bg, 0.2))};
     font-weight: 700;
-}
+}}
 
-/* ── base button ── */
-QPushButton {
-    background-color: #222222;
-    color: #cccccc;
-    border: 1px solid #3a3a3a;
+QPushButton {{
+    background-color: {_col(btn_bg)};
+    color: {_col(btn_txt)};
+    border: 1px solid {_col(border)};
     border-radius: 5px;
     padding: 5px 14px;
     font-size: 13px;
     font-weight: 600;
-}
-QPushButton:hover    { background-color: #2a2a2a; border-color: #555; }
-QPushButton:pressed  { background-color: #191919; }
-QPushButton:disabled { color: #404040; border-color: #252525; background:#1c1c1c; }
+}}
+QPushButton:hover    {{ background-color: {hover_bg}; border-color: {_col(light)}; }}
+QPushButton:pressed  {{ background-color: {_col(btn_pressed)}; }}
+QPushButton:disabled {{ color: {_col(dis_txt)}; border-color: {_col(_mix(border, window, 0.6))}; background: {_col(_mix(btn_bg, window, 0.5))}; }}
 
-/* ── coloured-border action buttons ── */
-QPushButton#btn_start  { border-color: #2d7d45; color: #88dd99; }
-QPushButton#btn_start:hover  { border-color: #3daa5d; background:#252525; }
-QPushButton#btn_start:disabled { border-color: #253530; color:#3d6347; }
+QPushButton#btn_start         {{ border-color: {g_bdr}; color: {g_txt}; }}
+QPushButton#btn_start:hover   {{ border-color: {_col(_lighter(QColor(g_bdr), 0.3))}; background: {hover_bg}; }}
+QPushButton#btn_start:disabled{{ border-color: {g_dbdr}; color: {g_dtxt}; }}
 
-QPushButton#btn_stop   { border-color: #7d5a20; color: #ddaa55; }
-QPushButton#btn_stop:hover   { border-color: #aa7a30; background:#252525; }
+QPushButton#btn_stop          {{ border-color: {y_bdr}; color: {y_txt}; }}
+QPushButton#btn_stop:hover    {{ border-color: {_col(_lighter(QColor(y_bdr), 0.3))}; background: {hover_bg}; }}
 
-QPushButton#btn_open   { border-color: #1f5f8a; color: #66aadd; }
-QPushButton#btn_open:hover   { border-color: #2d80ba; background:#252525; }
-QPushButton#btn_open:disabled { border-color: #1a2d38; color:#2a4a5a; }
+QPushButton#btn_open          {{ border-color: {b_bdr}; color: {b_txt}; }}
+QPushButton#btn_open:hover    {{ border-color: {_col(_lighter(QColor(b_bdr), 0.3))}; background: {hover_bg}; }}
+QPushButton#btn_open:disabled {{ border-color: {b_dbdr}; color: {b_dtxt}; }}
 
-QPushButton#btn_delete { border-color: #7a2222; color: #dd6666; }
-QPushButton#btn_delete:hover { border-color: #aa3333; background:#252525; }
-QPushButton#btn_delete:disabled { border-color: #2e1a1a; color:#4a2525; }
+QPushButton#btn_delete        {{ border-color: {r_bdr}; color: {r_txt}; }}
+QPushButton#btn_delete:hover  {{ border-color: {_col(_lighter(QColor(r_bdr), 0.3))}; background: {hover_bg}; }}
+QPushButton#btn_delete:disabled{{ border-color: {r_dbdr}; color: {r_dtxt}; }}
 
-/* ── inputs ── */
-QLineEdit, QSpinBox {
-    background-color: #1a1a1a;
-    border: 1px solid #333;
+QPushButton#btn_install_root        {{ border-color: {p_bdr}; color: {p_txt}; }}
+QPushButton#btn_install_root:hover  {{ border-color: {_col(_lighter(QColor(p_bdr), 0.3))}; background: {hover_bg}; }}
+QPushButton#btn_install_root:disabled{{ border-color: {p_dbdr}; color: {p_dtxt}; }}
+
+QPushButton#btn_install_user        {{ border-color: {c_bdr}; color: {c_txt}; }}
+QPushButton#btn_install_user:hover  {{ border-color: {_col(_lighter(QColor(c_bdr), 0.3))}; background: {hover_bg}; }}
+QPushButton#btn_install_user:disabled{{ border-color: {c_dbdr}; color: {c_dtxt}; }}
+
+QLineEdit, QSpinBox {{
+    background-color: {_col(input_bg)};
+    border: 1px solid {_col(border)};
     border-radius: 4px;
-    color: #d0d0d0;
+    color: {_col(txt)};
     font-size: 13px;
     font-weight: 600;
     padding: 4px 8px;
-    selection-background-color: #1f5f8a;
-}
-QLineEdit:focus, QSpinBox:focus { border-color: #1f5f8a; }
+    selection-background-color: {_col(hi)};
+    selection-color: {_col(hi_txt)};
+}}
+QLineEdit:focus, QSpinBox:focus {{ border-color: {_col(border_foc)}; }}
 
-QSpinBox { padding-right: 20px; }
-QSpinBox::up-button {
-    subcontrol-origin: border;
-    subcontrol-position: top right;
-    width: 20px; height: 13px;
-    background: #2e2e2e;
-    border: none;
-    border-left: 1px solid #3a3a3a;
-    border-bottom: 1px solid #3a3a3a;
-    border-top-right-radius: 4px;
-}
-QSpinBox::down-button {
-    subcontrol-origin: border;
-    subcontrol-position: bottom right;
-    width: 20px; height: 13px;
-    background: #2e2e2e;
-    border: none;
-    border-left: 1px solid #3a3a3a;
-    border-top: 1px solid #3a3a3a;
-    border-bottom-right-radius: 4px;
-}
-QSpinBox::up-button:hover, QSpinBox::down-button:hover { background: #3d3d3d; }
-QSpinBox::up-button:pressed, QSpinBox::down-button:pressed { background: #222; }
-QSpinBox::up-arrow {
-    image: none;
-    width: 0; height: 0;
-    border-style: solid;
-    border-width: 0 4px 6px 4px;
-    border-color: transparent transparent #c8c8c8 transparent;
-}
-QSpinBox::down-arrow {
-    image: none;
-    width: 0; height: 0;
-    border-style: solid;
-    border-width: 6px 4px 0 4px;
-    border-color: #c8c8c8 transparent transparent transparent;
-}
-QSpinBox::up-arrow:disabled   { border-bottom-color: #555; }
-QSpinBox::down-arrow:disabled { border-top-color: #555; }
-
-/* ── progress bar ── */
-QProgressBar {
-    background-color: #1a1a1a;
-    border: 1px solid #2e2e2e;
+QLineEdit#search_box {{
+    background-color: {preview_bg};
+    border: 1px solid {_col(border)};
     border-radius: 4px;
-    color: #888;
+    color: {_col(txt)};
+    padding: 5px 8px;
+    font-size: 12px;
+}}
+QLineEdit#search_box:focus {{ border-color: {_col(border_foc)}; }}
+
+QSvgWidget#svg_preview {{
+    background: {preview_bg};
+    border: 1px solid {preview_bdr};
+    border-radius: 7px;
+}}
+
+QLabel#lbl_muted  {{ color: {muted_txt}; font-size: 11px; font-weight: 600; }}
+QLabel#lbl_accent {{ color: {accent_txt}; font-size: 11px; font-weight: 600; }}
+
+QLabel#hint_box {{
+    color: {muted_txt};
+    font-style: italic;
+    font-size: 11px;
+    font-weight: 500;
+    background: {preview_bg};
+    padding: 10px;
+    border-radius: 6px;
+    border: 1px solid {preview_bdr};
+}}
+
+QSpinBox {{ padding-right: 20px; }}
+QSpinBox::up-button {{
+    subcontrol-origin: border; subcontrol-position: top right;
+    width: 20px; height: 13px;
+    background: {_col(btn_bg)};
+    border: none;
+    border-left: 1px solid {_col(border)};
+    border-bottom: 1px solid {_col(border)};
+    border-top-right-radius: 4px;
+}}
+QSpinBox::down-button {{
+    subcontrol-origin: border; subcontrol-position: bottom right;
+    width: 20px; height: 13px;
+    background: {_col(btn_bg)};
+    border: none;
+    border-left: 1px solid {_col(border)};
+    border-top: 1px solid {_col(border)};
+    border-bottom-right-radius: 4px;
+}}
+QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background: {hover_bg}; }}
+QSpinBox::up-button:pressed, QSpinBox::down-button:pressed {{ background: {_col(btn_pressed)}; }}
+QSpinBox::up-arrow {{
+    image: none; width: 0; height: 0;
+    border-style: solid; border-width: 0 4px 6px 4px;
+    border-color: transparent transparent {arr_col} transparent;
+}}
+QSpinBox::down-arrow {{
+    image: none; width: 0; height: 0;
+    border-style: solid; border-width: 6px 4px 0 4px;
+    border-color: {arr_col} transparent transparent transparent;
+}}
+QSpinBox::up-arrow:disabled   {{ border-bottom-color: {arr_dis}; }}
+QSpinBox::down-arrow:disabled {{ border-top-color:    {arr_dis}; }}
+
+QProgressBar {{
+    background-color: {_col(input_bg)};
+    border: 1px solid {_col(border)};
+    border-radius: 4px;
+    color: {_col(_mix(win_txt, window, 0.4))};
     text-align: center;
     font-size: 11px;
-}
-QProgressBar::chunk {
-    background-color: #2a6a3a;
+}}
+QProgressBar::chunk {{
+    background-color: {g_bdr};
     border-radius: 3px;
-}
+}}
 
-/* ── checkbox ── */
-QCheckBox { color: #c8c8c8; spacing: 6px; font-size: 13px; font-weight: 600; }
-QCheckBox::indicator {
+QCheckBox {{ color: {_col(win_txt)}; spacing: 6px; font-size: 13px; font-weight: 600; }}
+QCheckBox::indicator {{
     width: 13px; height: 13px;
-    border: 1px solid #444; border-radius: 3px; background: #1a1a1a;
-}
-QCheckBox::indicator:checked {
-    background: #2a6a3a; border-color: #3a8a4a;
-    image: none;
-}
-QCheckBox::indicator:hover { border-color: #666; }
+    border: 1px solid {_col(border)}; border-radius: 3px;
+    background: {_col(input_bg)};
+}}
+QCheckBox::indicator:checked {{
+    background: {g_bdr}; border-color: {g_txt};
+}}
+QCheckBox::indicator:hover {{ border-color: {_col(light)}; }}
 
-/* ── scrollbars ── */
-QScrollBar:vertical {
-    background: #151515; width: 7px; border-radius: 4px; border: none;
-}
-QScrollBar::handle:vertical {
-    background: #333; border-radius: 3px; min-height: 20px;
-}
-QScrollBar::handle:vertical:hover { background: #444; }
-QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
+QScrollBar:vertical {{
+    background: {_col(scroll_bg)}; width: 7px; border-radius: 4px; border: none;
+}}
+QScrollBar::handle:vertical {{
+    background: {_col(scroll_hdl)}; border-radius: 3px; min-height: 20px;
+}}
+QScrollBar::handle:vertical:hover {{ background: {_col(_mix(scroll_hdl, light, 0.3))}; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
 
-/* ── message box ── */
-QMessageBox { background: #1a1a1a; }
-QMessageBox QLabel { color: #ccc; }
+QMessageBox {{ background: {_col(window)}; }}
+QMessageBox QLabel {{ color: {_col(win_txt)}; }}
 """
 
 
@@ -763,14 +1158,13 @@ class SVGRecolorGUI(QMainWindow):
         pl = QVBoxLayout(pg)
         self.svg_w = QSvgWidget()
         self.svg_w.setFixedSize(320, 320)
-        self.svg_w.setStyleSheet(
-            'QSvgWidget{background:#1a1a1a;border:1px solid #2e2e2e;border-radius:7px;}')
+        self.svg_w.setObjectName('svg_preview')
         pl.addWidget(self.svg_w, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self.lbl_fname = QLabel('No preview')
         self.lbl_fname.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_fname.setWordWrap(True)
-        self.lbl_fname.setStyleSheet('color:#666;font-size:11px;')
+        self.lbl_fname.setObjectName('lbl_muted')
         pl.addWidget(self.lbl_fname)
 
         nav = QHBoxLayout()
@@ -779,7 +1173,7 @@ class SVGRecolorGUI(QMainWindow):
         nav.addWidget(self.btn_prev)
         self.lbl_count = QLabel('0 / 0')
         self.lbl_count.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_count.setStyleSheet('color:#666;')
+        self.lbl_count.setObjectName('lbl_muted')
         nav.addWidget(self.lbl_count)
         self.btn_next = QPushButton('▶')
         self.btn_next.setFixedSize(58, 32); self.btn_next.clicked.connect(self._next)
@@ -793,15 +1187,12 @@ class SVGRecolorGUI(QMainWindow):
         search_lay.setContentsMargins(0, 0, 0, 0)
         search_lay.setSpacing(6)
         search_lbl = QLabel('🔍')
-        search_lbl.setStyleSheet('color:#888;font-size:13px;')
+        search_lbl.setObjectName('lbl_muted')
         search_lay.addWidget(search_lbl)
         self.search_box = QLineEdit()
+        self.search_box.setObjectName('search_box')
         self.search_box.setPlaceholderText('Search files — filters preview & log…')
         self.search_box.setClearButtonEnabled(True)
-        self.search_box.setStyleSheet(
-            'QLineEdit{background:#1a1a1a;border:1px solid #333;border-radius:4px;'
-            'color:#d0d0d0;padding:5px 8px;font-size:12px;}'
-            'QLineEdit:focus{border-color:#1f5f8a;}')
         self.search_box.textChanged.connect(self._on_search_changed)
         search_lay.addWidget(self.search_box)
         lv.addWidget(search_w)
@@ -832,7 +1223,7 @@ class SVGRecolorGUI(QMainWindow):
         ol = QVBoxLayout(og)
         self.lbl_output = QLabel('— (will be created as a sibling next to source folder)')
         self.lbl_output.setWordWrap(True)
-        self.lbl_output.setStyleSheet('color:#557799;font-size:11px;')
+        self.lbl_output.setObjectName('lbl_accent')
         ol.addWidget(self.lbl_output)
         rv.addWidget(og)
 
@@ -846,19 +1237,32 @@ class SVGRecolorGUI(QMainWindow):
         cgl.addWidget(self.spin); cgl.addStretch()
         rv.addWidget(cg)
 
-        # Gradient buttons
-        gg = QGroupBox('Gradient Colours  (multi-colour icons)')
-        ggl = QGridLayout(gg); ggl.setSpacing(6)
+        # Gradient color ramp (Blender-style)
+        gg = QGroupBox('Gradient Colours  (multi-colour icons — click a stop to change)')
+        ggl = QVBoxLayout(gg); ggl.setSpacing(8)
+
         LABELS   = ['Color 1','Color 2','Color 3','Color 4','Color 5','Color 6']
         DEFAULTS = ['#000000','#464646','#D81C4A','#b6b6b6','#ffffff','#888888']
         self.cbts = []
         for i in range(6):
-            w=QWidget(); wl=QHBoxLayout(w); wl.setContentsMargins(3,3,3,3)
-            b=ColorButton(DEFAULTS[i], LABELS[i])
-            self.cbts.append(b); wl.addWidget(b)
-            lb=QLabel(LABELS[i]); lb.setStyleSheet('color:#999;font-size:11px;')
-            wl.addWidget(lb); wl.addStretch()
-            ggl.addWidget(w, i//3, i%3)
+            b = ColorButton(DEFAULTS[i], LABELS[i])
+            b.setVisible(False)      # hidden — ramp handles are the UI
+            self.cbts.append(b)
+            ggl.addWidget(b)         # keep in layout for signals; hidden
+
+        self.grad_ramp = GradientRamp(self.cbts)
+        # Wire color changes from all buttons to repaint the ramp
+        for b in self.cbts:
+            # Monkey-patch set_color so ramp repaints after any pick
+            orig_set = b.set_color
+            def make_set(btn, orig):
+                def set_and_repaint(color):
+                    orig(color)
+                    self.grad_ramp.update()
+                return set_and_repaint
+            b.set_color = make_set(b, orig_set)
+
+        ggl.addWidget(self.grad_ramp)
         rv.addWidget(gg)
 
         # Mono colour
@@ -902,6 +1306,20 @@ class SVGRecolorGUI(QMainWindow):
         self.btn_delete.clicked.connect(self._delete_output)
         al.addWidget(self.btn_delete, 2, 0, 1, 2)
 
+        self.btn_install_root = QPushButton('🔒  Install for Root  (/usr/share/icons/…)')
+        self.btn_install_root.setObjectName('btn_install_root')
+        self.btn_install_root.setFixedHeight(42)
+        self.btn_install_root.setEnabled(False)
+        self.btn_install_root.clicked.connect(self._install_root)
+        al.addWidget(self.btn_install_root, 3, 0)
+
+        self.btn_install_user = QPushButton('👤  Install for User  (~/.local/share/icons/…)')
+        self.btn_install_user.setObjectName('btn_install_user')
+        self.btn_install_user.setFixedHeight(42)
+        self.btn_install_user.setEnabled(False)
+        self.btn_install_user.clicked.connect(self._install_user)
+        al.addWidget(self.btn_install_user, 3, 1)
+
         rv.addWidget(ag)
 
         # Progress bar
@@ -920,9 +1338,7 @@ class SVGRecolorGUI(QMainWindow):
             '• "Delete Output" removes only the last output folder.'
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet(
-            'color:#777;font-style:italic;font-size:11px;font-weight:500;'
-            'background:#1a1a1a;padding:10px;border-radius:6px;border:1px solid #2a2a2a;')
+        hint.setObjectName('hint_box')
         rv.addWidget(hint)
 
         rv.addStretch()
@@ -932,8 +1348,9 @@ class SVGRecolorGUI(QMainWindow):
 
     def _refresh_cbts(self):
         n = self.spin.value()
-        for i,b in enumerate(self.cbts):
-            b.setVisible(i<n); b.setEnabled(i<n)
+        for i, b in enumerate(self.cbts):
+            b.setEnabled(i < n)
+        self.grad_ramp.set_active(n)
 
     # ── state ──────────────────────────────────────────────────────────────
 
@@ -944,6 +1361,8 @@ class SVGRecolorGUI(QMainWindow):
         self.btn_stop.setEnabled(busy)
         self.btn_open.setEnabled(not busy and has_out)
         self.btn_delete.setEnabled(not busy and has_out)
+        self.btn_install_root.setEnabled(not busy and has_out)
+        self.btn_install_user.setEnabled(not busy and has_out)
         n = len(self.preview_list)
         self.btn_prev.setEnabled(n>0 and self.preview_idx>0)
         self.btn_next.setEnabled(n>0 and self.preview_idx<n-1)
@@ -1017,6 +1436,155 @@ class SVGRecolorGUI(QMainWindow):
         if self.preview_idx<len(self.preview_list)-1:
             self.preview_idx+=1; self._show_preview(); self._sync()
 
+    # ── install ────────────────────────────────────────────────────────────
+
+    def _theme_name(self):
+        """Original source folder name — used as install target name."""
+        if self.directory:
+            return os.path.basename(self.directory.rstrip('/\\'))
+        return os.path.basename(self.output_dir) if self.output_dir else 'icons'
+
+    def _find_theme_roots(self, folder: str) -> list:
+        """
+        Return the list of directories that should be installed as icon themes.
+        A 'theme root' is a directory that directly contains size-dirs (16x16,
+        22x22, 24x24, …) or an index.theme file.
+        If the output folder itself is a theme root → [folder].
+        Otherwise look one level deeper (handles zips where the top dir is a
+        release name containing Papirus/, Papirus-Dark/, etc.).
+        """
+        import re
+        size_re = re.compile(r'^\d+x\d+$')
+
+        def is_theme_root(d):
+            try:
+                entries = os.listdir(d)
+            except OSError:
+                return False
+            return (
+                'index.theme' in entries or
+                any(size_re.match(e) and os.path.isdir(os.path.join(d, e))
+                    for e in entries)
+            )
+
+        if is_theme_root(folder):
+            return [folder]
+
+        # One level down
+        roots = []
+        try:
+            for name in sorted(os.listdir(folder)):
+                sub = os.path.join(folder, name)
+                if os.path.isdir(sub) and is_theme_root(sub):
+                    roots.append(sub)
+        except OSError:
+            pass
+        return roots or [folder]   # fallback
+
+    def _install(self, base_dir: str, root: bool):
+        if not (self.output_dir and os.path.exists(self.output_dir)):
+            self._log('❌ Output folder not found.', 'err'); return
+
+        theme_roots = self._find_theme_roots(self.output_dir)
+        default_name = self._theme_name()
+
+        # Build (src_dir, dest_dir, theme_name) list
+        installs = []
+        for tr in theme_roots:
+            if tr == self.output_dir:
+                name = default_name
+            else:
+                name = os.path.basename(tr)
+            installs.append((tr, os.path.join(base_dir, name), name))
+
+        # Confirm
+        dest_list = '\n'.join(d for _, d, _ in installs)
+        confirm = QMessageBox.question(
+            self, 'Install Icon Theme',
+            'Install {} theme(s) to:\n\n{}'.format(len(installs), dest_list),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        # Overwrite warning for any that already exist
+        existing = [d for _, d, _ in installs if os.path.exists(d)]
+        if existing:
+            warn = QMessageBox(self)
+            warn.setWindowTitle('Theme Already Exists')
+            warn.setIcon(QMessageBox.Icon.Warning)
+            warn.setText(
+                'The following theme(s) already exist and will be overwritten:\n\n'
+                + '\n'.join(existing))
+            btn_cont = warn.addButton('Continue', QMessageBox.ButtonRole.AcceptRole)
+            warn.addButton('Cancel', QMessageBox.ButtonRole.RejectRole)
+            warn.exec()
+            if warn.clickedButton() is not btn_cont:
+                return
+
+        if root:
+            self._install_root_sudo(installs, base_dir)
+        else:
+            for src, dest, name in installs:
+                try:
+                    os.makedirs(base_dir, exist_ok=True)
+                    if os.path.exists(dest):
+                        shutil.rmtree(dest)
+                    shutil.copytree(src, dest)
+                    self._post_install(dest, name)
+                except Exception as e:
+                    self._log('❌ Install error ({}): {}'.format(name, e), 'err')
+
+    def _install_root_sudo(self, installs: list, base_dir: str):
+        from PyQt6.QtWidgets import QInputDialog, QLineEdit
+
+        password, ok = QInputDialog.getText(
+            self, 'Root Password Required',
+            'Enter your sudo password to install to:\n{}'.format(base_dir),
+            QLineEdit.EchoMode.Password,
+        )
+        if not ok or not password:
+            self._log('⚠️  Root install cancelled.'); return
+
+        for src, dest, name in installs:
+            shell_cmd = "rm -rf '{d}' && mkdir -p '{d}' && cp -r '{s}/.' '{d}/'".format(
+                s=src, d=dest)
+            try:
+                result = subprocess.run(
+                    ['sudo', '-S', 'sh', '-c', shell_cmd],
+                    input=password + '\n',
+                    capture_output=True, text=True, timeout=60,
+                )
+                if result.returncode != 0:
+                    err = '\n'.join(
+                        l for l in (result.stderr or '').splitlines()
+                        if 'password' not in l.lower() and l.strip())
+                    self._log('❌ Root install failed ({}): {}'.format(
+                        name, err or 'sudo error'), 'err')
+                    continue
+                self._post_install(dest, name)
+            except subprocess.TimeoutExpired:
+                self._log('❌ Root install timed out ({}).'.format(name), 'err')
+            except Exception as e:
+                self._log('❌ Root install error ({}): {}'.format(name, e), 'err')
+
+    def _post_install(self, dest: str, name: str):
+        self._log('✅  Installed: {}'.format(dest))
+        try:
+            subprocess.run(
+                ['gtk-update-icon-cache', '-f', '-t', dest],
+                capture_output=True, check=False, timeout=10)
+            self._log('   gtk-update-icon-cache: {}'.format(name))
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+    def _install_root(self):
+        self._install('/usr/share/icons', root=True)
+
+    def _install_user(self):
+        user_icons = os.path.join(os.path.expanduser('~'), '.local', 'share', 'icons')
+        self._install(user_icons, root=False)
+
     # ── output folder ──────────────────────────────────────────────────────
 
     def _make_out_dir(self):
@@ -1052,8 +1620,11 @@ class SVGRecolorGUI(QMainWindow):
         self.progress.setValue(0); self.progress.setMaximum(1)
         self.progress.show()
 
-        colors = [self.cbts[i].hex() for i in range(self.spin.value())]
-        mono   = self.mono_btn.hex()
+        # Read colours AND their positions in ramp order (handles may have been dragged)
+        sorted_stops = self.grad_ramp._sorted_stops()   # [(t, idx), ...] sorted by t
+        colors    = [self.cbts[i].hex() for _, i in sorted_stops]
+        positions = [t for t, _ in sorted_stops]
+        mono      = self.mono_btn.hex()
         n_workers = min((os.cpu_count() or 4)*2, 16)
 
         sep = '═'*58
@@ -1062,13 +1633,13 @@ class SVGRecolorGUI(QMainWindow):
                   sep,
                   '  Source   : {}'.format(self.directory),
                   '  Output   : {}'.format(self.output_dir),
-                  '  Workers  : {} threads'.format(n_workers),
+                  '  Workers  : {} processes'.format(n_workers),
                   '  Colours  : {}'.format(' → '.join(colors)),
                   '  Mono     : {}'.format(mono),
                   sep):
             self._log(t, 'sep')
 
-        self.thread = ProcessThread(self.directory, self.output_dir, colors, mono)
+        self.thread = ProcessThread(self.directory, self.output_dir, colors, mono, positions)
         self.thread.file_done.connect(self._on_file_done)
         self.thread.progress.connect(self._on_progress)
         self.thread.finished.connect(self._on_done)
@@ -1129,13 +1700,27 @@ class SVGRecolorGUI(QMainWindow):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    if sys.platform=='linux':
+    if sys.platform == 'linux':
         os.environ.pop('QT_QPA_PLATFORM_PLUGIN_PATH', None)
         os.environ.pop('QT_QPA_PLATFORM', None)
+
     app = QApplication(sys.argv)
-    app.setStyle('Fusion')
-    app.setStyleSheet(_APP_QSS)
+    app.setStyle('Fusion')   # consistent cross-distro widget shapes
+
     win = SVGRecolorGUI()
+
+    def apply_theme():
+        app.setStyleSheet(build_qss(app.palette()))
+        # Custom-painted widgets read the palette directly in paintEvent;
+        # force a repaint so they pick up the new colours immediately.
+        win.grad_ramp.update()
+        win.flog._rebuild()
+
+    apply_theme()
+
+    # Re-apply whenever the system palette/theme changes
+    app.paletteChanged.connect(lambda _: apply_theme())
+
     win.show()
     sys.exit(app.exec())
 
